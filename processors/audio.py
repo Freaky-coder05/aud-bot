@@ -1,8 +1,3 @@
-"""
-processors/audio.py
-───────────────────
-Extract Tamil audio track from MKV, convert to libopus 40 kbps .opus file.
-"""
 import asyncio
 import json
 import logging
@@ -49,16 +44,32 @@ def _probe_tamil_index(mkv: Path) -> int | None:
     return None
 
 
-async def extract_and_convert(mkv_path: Path, output_base: Path) -> Path | None:
+def _get_duration(file_path: Path) -> int:
+    """Extract the duration of the audio file in seconds."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
+            capture_output=True, text=True
+        )
+        return int(float(r.stdout.strip()))
+    except Exception:
+        return 0
+
+
+async def extract_and_convert(mkv_path: Path, output_base: Path) -> tuple[Path | None, int]:
     """
     Extract Tamil audio from `mkv_path`, write `output_base.opus`.
     Tries ffprobe first; falls back to common track indices (2, 1, 3).
-    Returns Path to .opus, or None.
+    Returns a tuple: (Path to .opus, duration_in_seconds), or (None, 0).
     """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         log.error("ffmpeg not found")
-        return None
+        return None, 0
 
     loop = asyncio.get_event_loop()
 
@@ -71,6 +82,7 @@ async def extract_and_convert(mkv_path: Path, output_base: Path) -> Path | None:
     else:
         maps = ["0:a:2", "0:a:1", "0:a:3"]   # common Tamil positions
 
+    # Note: Telegram usually handles Opus better inside an standard .ogg container
     opus_path = output_base.with_suffix(".opus")
 
     for stream_map in maps:
@@ -93,10 +105,14 @@ async def extract_and_convert(mkv_path: Path, output_base: Path) -> Path | None:
         if opus_path.exists() and opus_path.stat().st_size > 0:
             log.info(f"  Opus ready: {opus_path} "
                      f"({opus_path.stat().st_size/1024/1024:.1f} MB)")
-            return opus_path
+            
+            # Extract duration before returning
+            duration = await loop.run_in_executor(None, _get_duration, opus_path)
+            
+            return opus_path, duration
 
         log.warning(f"  map {stream_map} failed — trying next")
         opus_path.unlink(missing_ok=True)
 
     log.error(f"All stream maps failed. ffmpeg last stderr:\n{result.stderr[-600:]}")
-    return None
+    return None, 0

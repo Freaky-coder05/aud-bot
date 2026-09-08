@@ -23,14 +23,17 @@ async def _status(msg, text: str):
             pass
 
 
-async def _upload(client, opus: Path,
-                  anime_name: str, season: int, episode: int | None):
+# ── Make duration default to 0 so it's optional ──
+async def _upload(client, opus: Path, anime_name: str, season: int, 
+                  episode: int | None, duration: int = 0):
+
     ep_tag = f"E{episode:02d}" if episode else "Latest"
     caption = (
         f"🎌 **{anime_name.title()}**\n"
         f"Season {season} · {ep_tag}\n"
         f"🎧 Tamil Audio · libopus {Config.AUDIO_BITRATE}"
     )
+    
     try:
         await client.send_audio(
             chat_id   = Config.DB_CHANNEL,
@@ -38,11 +41,17 @@ async def _upload(client, opus: Path,
             caption   = caption,
             title     = f"{anime_name.title()} S{season:02d}{ep_tag} [TA]",
             performer = "Anime Audio Bot",
+            duration  = duration,  # If this is 0, Telegram ignores it automatically
         )
-        log.info(f"Uploaded: {opus.name}")
+        
+        # Log whether it had a duration or not
+        dur_text = f" (Duration: {duration}s)" if duration else ""
+        log.info(f"Uploaded: {opus.name}{dur_text}")
+        
         if episode:
             mode = await get_mode()
             await mark_episode_done(anime_name, season, episode, mode)
+            
     except Exception as e:
         log.error(f"Upload failed: {e}")
 
@@ -119,7 +128,7 @@ async def _pipeline_ytdlp(client, name, season, page_url,
 # ── Mode 2 — Direct 480p MKV ─────────────────────────────────────────────────
 
 async def _pipeline_direct(client, name, season, page_url,
-                            dl_dir, episode, status_msg):
+                           dl_dir, episode, status_msg):
     from scrapers.episode_fetcher  import fetch_gdshare_url
     from scrapers.gd_downloader    import download_from_gdshare
     from processors.audio          import extract_and_convert
@@ -148,7 +157,9 @@ async def _pipeline_direct(client, name, season, page_url,
 
     await _status(status_msg, "🎵 Extracting Tamil audio track…")
     base = dl_dir / f"{name}_S{season:02d}_ta"
-    opus = await extract_and_convert(mkv, base)
+    
+    # ── UNPACK PATH AND DURATION HERE ──
+    opus, duration = await extract_and_convert(mkv, base)
     mkv.unlink(missing_ok=True)
 
     if not opus:
@@ -156,6 +167,9 @@ async def _pipeline_direct(client, name, season, page_url,
         return
 
     await _status(status_msg, "📤 Uploading to channel…")
-    await _upload(client, opus, name, season, ep)
+    
+    # ── PASS DURATION TO UPLOAD FUNCTION ──
+    await _upload(client, opus, name, season, ep, duration=duration)
+    
     opus.unlink(missing_ok=True)
     await _status(status_msg, f"✅ Done: {name.title()} S{season}")
