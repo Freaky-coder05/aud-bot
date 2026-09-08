@@ -30,7 +30,7 @@ class Config:
     SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "screenshots")  # Colab debug
 
     # ── Browser ───────────────────────────────────────────────────────────────
-    HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+    HEADLESS = os.getenv("HEADLESS", "false").lower() == "false"
 
     # ── Audio ─────────────────────────────────────────────────────────────────
     AUDIO_CODEC   = "libopus"
