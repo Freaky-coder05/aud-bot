@@ -1,0 +1,41 @@
+{
+  "anime": [
+    {
+      "name": "hanaori-san still wants to fight in the next life",
+      "season": 1,
+      "page_url": "https://hindianimeszone.com/hanaori-san-still-wants-to-fight-in-the-next-life-season-1-multi-audio-hindi-tamil-telugu-eng-jap-480p-720p-1080p-hd-web-dl-10bit-hevc-esub",
+      "aliases": [
+        "hanaori-san still wants to fight in the next life"
+      ]
+    },
+    {
+      "name": "skeleton knight in another world",
+      "season": 1,
+      "page_url": "https://hindianimeszone.com/skeleton-knight-in-another-world-season-1-bluray-multi-audio/",
+      "aliases": [
+        "skeleton knight in another world"
+      ]
+    },
+    {
+      "name": "sword art online",
+      "season": 1,
+      "page_url": "https://hindianimeszone.com/sword-art-online-season-1-bluray-multi-audio-hindi-tamil-telugu-eng-jap-480p-720p-1080p-hd-10bit-hevc-esub-crunchyroll-dub/",
+      "aliases": [
+        "sword art online"
+      ]
+    }
+  ],
+  "schedules": [],
+  "settings": {
+    "mode": 2
+  },
+  "episodes": [
+    {
+      "anime": "hanaori-san still wants to fight in the next life",
+      "season": 1,
+      "episode": 1,
+      "mode": 2,
+      "done": true
+    }
+  ]
+}

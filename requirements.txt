@@ -1,0 +1,23 @@
+# Telegram
+pyrofork
+tgcrypto
+
+# Browser automation
+playwright
+playwright-stealth
+
+# Audio / video
+yt-dlp
+aiohttp
+
+# MongoDB (async) — only needed when USE_MONGO=true
+motor
+pymongo
+dnspython
+
+# Scheduler
+APScheduler
+pytz
+
+# Config
+python-dotenv
