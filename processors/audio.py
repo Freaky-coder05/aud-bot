@@ -62,9 +62,9 @@ def _get_duration(file_path: Path) -> int:
 
 async def extract_and_convert(mkv_path: Path, output_base: Path) -> tuple[Path | None, int]:
     """
-    Extract Tamil audio from `mkv_path`, write `output_base.opus`.
+    Extract Tamil audio from `mkv_path` (original stream copy).
     Tries ffprobe first; falls back to common track indices (2, 1, 3).
-    Returns a tuple: (Path to .opus, duration_in_seconds), or (None, 0).
+    Returns a tuple: (Path to audio file, duration_in_seconds), or (None, 0).
     """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -82,8 +82,8 @@ async def extract_and_convert(mkv_path: Path, output_base: Path) -> tuple[Path |
     else:
         maps = ["0:a:2", "0:a:1", "0:a:3"]   # common Tamil positions
 
-    # Note: Telegram usually handles Opus better inside an standard .ogg container
-    opus_path = output_base.with_suffix(".opus")
+    # Use .mka (Matroska Audio) since we are stream-copying from MKV
+    audio_path = output_base.with_suffix(".mka")
 
     for stream_map in maps:
         log.info(f"  Trying map {stream_map}…")
@@ -91,10 +91,9 @@ async def extract_and_convert(mkv_path: Path, output_base: Path) -> tuple[Path |
             ffmpeg, "-y",
             "-i", str(mkv_path),
             "-map", stream_map,
-            "-vn",
-            "-c:a", Config.AUDIO_CODEC,
-            "-b:a", Config.AUDIO_BITRATE,
-            str(opus_path),
+            "-vn",           # No video
+            "-c:a", "copy",  # Copy original audio codec (no re-encoding)
+            str(audio_path),
         ]
 
         def _run(c=cmd):
@@ -102,17 +101,18 @@ async def extract_and_convert(mkv_path: Path, output_base: Path) -> tuple[Path |
 
         result = await loop.run_in_executor(None, _run)
 
-        if opus_path.exists() and opus_path.stat().st_size > 0:
-            log.info(f"  Opus ready: {opus_path} "
-                     f"({opus_path.stat().st_size/1024/1024:.1f} MB)")
+        if audio_path.exists() and audio_path.stat().st_size > 0:
+            log.info(f"  Audio ready: {audio_path} "
+                     f"({audio_path.stat().st_size/1024/1024:.1f} MB)")
             
             # Extract duration before returning
-            duration = await loop.run_in_executor(None, _get_duration, opus_path)
+            duration = await loop.run_in_executor(None, _get_duration, audio_path)
             
-            return opus_path, duration
+            return audio_path, duration
 
         log.warning(f"  map {stream_map} failed — trying next")
-        opus_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
 
     log.error(f"All stream maps failed. ffmpeg last stderr:\n{result.stderr[-600:]}")
     return None, 0
+    
