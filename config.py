@@ -14,7 +14,7 @@ class Config:
     # ── Channels ──────────────────────────────────────────────────────────────
     SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@HindiAnimeZonecom")
     DB_CHANNEL     = int(os.getenv("DB_CHANNEL", -1002201298270))
-    ADMIN_IDS      = [int(x) for x in os.getenv("ADMIN_IDS", "6299192020").split(",") if x.strip()]
+    ADMIN_IDS      = [int(x) for x in os.getenv("ADMIN_IDS", "6299192020,6693549185").split(",") if x.strip()]
 
     # ── MongoDB (optional) ────────────────────────────────────────────────────
     # Set USE_MONGO=false in .env to use JSON file storage instead
