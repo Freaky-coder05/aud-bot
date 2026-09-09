@@ -318,7 +318,14 @@ async def fetch_gdshare_url(anime_url: str,
             log.error("❌ No download1 URL"); await browser.close(); return None, episode_num
 
         log.info(f"  download1: {download1_url}")
+        # --- NEW URL MODIFICATION LOGIC ---
+        # Replaces the subdomain (e.g., '002') with 'files' and '/download1' with '/dl.php'
+        download1_url = re.sub(r'https://[^.]+\.', 'https://files.', download1_url)
+        download1_url = download1_url.replace('/download1', '/dl.php')
+        # ----------------------------------
 
+        log.info(f"  download1 (Modified): {download1_url}")
+      
         # ── Step 3: Block CF Turnstile then navigate to download1 ─────────────
         # KEY FIX for VPS 403:
         # We abort ALL requests to challenges.cloudflare.com BEFORE navigating.
