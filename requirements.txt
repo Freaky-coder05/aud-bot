@@ -18,6 +18,7 @@ dnspython
 # Scheduler
 APScheduler
 pytz
+tzdata
 
 # Config
 python-dotenv
