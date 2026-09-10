@@ -1,11 +1,16 @@
 """
 episode_fetcher.py
 ──────────────────
-MODE 1  fetch_m3u8()        — intercept master.m3u8 from video player
-MODE 2  fetch_gdshare_url() — get Gdshare URL via:
-          1. Playwright → main page → extract download1 URL
-          2. Modify URL: 002.hindianimeszone.com/download1 → files.hindianimeszone.com/dl.php
-          3. DrissionPage → navigate modified URL → handle CF "Continue" button → get Gdshare
+MODE 1  fetch_m3u8()        — Playwright → intercept master.m3u8
+MODE 2  fetch_gdshare_url() — Playwright → main page → extract download1 URL
+                              DrissionPage → download1 → CF auto-verify passes
+                              (real Chrome fingerprint) → click Continue → Gdshare URL
+
+WHY DrissionPage for download1:
+  On VPS/Koyeb, CF auto-verify ("Verifying...") detects Playwright's Chromium
+  as a bot and never resolves. DrissionPage uses the real installed Chrome binary
+  with a full fingerprint (fonts, GPU, profile) so CF auto-verify passes cleanly,
+  then we just click Continue.
 """
 import asyncio
 import logging
@@ -20,8 +25,11 @@ from config import Config
 
 log = logging.getLogger(__name__)
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) "
-      "Gecko/20100101 Firefox/154.0")
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 
 _SS_DIR = Path(Config.SCREENSHOT_DIR)
 
@@ -32,20 +40,7 @@ def _ss(name: str) -> str:
     return str(_SS_DIR / f"{ts}_{name}.png")
 
 
-# ── URL modifier ──────────────────────────────────────────────────────────────
-
-def _modify_download1_url(url: str) -> str:
-    """
-    Convert:  https://002.hindianimeszone.com/download1[.php]?...
-    To:       https://files.hindianimeszone.com/dl.php?...
-    This subdomain has a simpler CF check (Continue button, 1hr valid).
-    """
-    url = re.sub(r'https://[^.]+\.', 'https://files.', url)
-    url = re.sub(r'/download1(?:\.php)?', '/dl.php', url)
-    return url
-
-
-# ── Shared helpers ────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _has_turnstile(page) -> bool:
     for frame in page.frames:
@@ -93,27 +88,23 @@ def _parse_gdshare(html: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DrissionPage handler for files.hindianimeszone.com/dl.php
+# DrissionPage — handles download1 CF auto-verify + Continue + Gdshare extract
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _drission_get_gdshare(dl_url: str, anime_url: str) -> str | None:
+def _drission_get_gdshare(download1_url: str) -> str | None:
     """
-    Uses DrissionPage (real Chrome, better CF bypass) to:
-      1. Open files.hindianimeszone.com/dl.php URL
-      2. Detect "Verify You're Human" / "Continue" button
-      3. Click the CF Turnstile checkbox (inside iframe)
-      4. Click Continue button
-      5. Extract Gdshare URL from page
+    Uses DrissionPage (real Chrome) to:
+      1. Open download1 URL
+      2. Wait for CF "Verifying..." to auto-resolve (passes because real Chrome)
+      3. Click Continue button
+      4. Extract Gdshare URL from the download page
 
-    DrissionPage passes CF more reliably because it uses the actual
-    installed Chrome binary with a real profile fingerprint.
-
-    Returns: gdshare URL string or None
+    This is a blocking function — called via run_in_executor from async context.
     """
     try:
         from DrissionPage import ChromiumPage, ChromiumOptions
     except ImportError:
-        log.error("DrissionPage not installed — pip install DrissionPage")
+        log.error("[DrissionPage] Not installed — run: pip install DrissionPage")
         return None
 
     gdshare_url = None
@@ -125,105 +116,74 @@ def _drission_get_gdshare(dl_url: str, anime_url: str) -> str | None:
         co.set_argument("--disable-dev-shm-usage")
         co.set_argument("--disable-blink-features=AutomationControlled")
 
-        if Config.PROXY_URL:
-            co.set_proxy(Config.PROXY_URL)
-            log.info(f"  [DrissionPage] Using proxy: {Config.PROXY_URL[:30]}...")
+        
 
         dp = ChromiumPage(addr_or_opts=co)
 
-        log.info(f"  [DrissionPage] Navigating: {dl_url}")
-        dp.get(dl_url)
-        dp.wait(4)
+        # ── Navigate ──────────────────────────────────────────────────────────
+        log.info(f"  [DrissionPage] Opening: {download1_url}")
+        dp.get(download1_url)
+        log.info(f"  [DrissionPage] Title: {dp.title}")
 
-        log.info(f"  [DrissionPage] Page title: {dp.title}")
-
-        # ── Handle Cloudflare Turnstile checkbox (inside CF iframe) ──────────
-        # DrissionPage can find elements inside iframes easily
-        for attempt in range(1, 4):
-            page_text = dp.html.lower()
-
-            # Check if we're past CF already (Gdshare link visible)
-            if "gdshare" in page_text or "data-label" in page_text:
-                log.info(f"  [DrissionPage] CF passed — content visible")
+        # ── Wait for CF auto-verify to resolve ────────────────────────────────
+        # "Verifying..." spinner resolves on its own with real Chrome fingerprint.
+        # Poll until "Verifying..." text disappears from the page.
+        log.info("  [DrissionPage] Waiting for CF auto-verify to resolve...")
+        for i in range(40):
+            html_lower = dp.html.lower()
+            if "verifying" not in html_lower:
+                log.info(f"  [DrissionPage] ✅ Auto-verify resolved in ~{i}s")
                 break
-
-            # Check for Turnstile iframe
-            cf_frame = None
-            for frame in dp.get_frames():
-                try:
-                    if "challenges.cloudflare.com" in frame.url:
-                        cf_frame = frame
-                        break
-                except Exception:
-                    pass
-
-            if cf_frame:
-                log.info(f"  [DrissionPage] CF Turnstile iframe found (attempt {attempt}/3)")
-                try:
-                    # Click the checkbox inside the iframe
-                    checkbox = cf_frame.ele("xpath://input[@type='checkbox']", timeout=5)
-                    if checkbox:
-                        checkbox.click()
-                        log.info("  [DrissionPage] ✓ Checkbox clicked")
-                        dp.wait(4)
-                        continue
-                except Exception:
-                    pass
-
-                try:
-                    # Alternative: click the widget div itself
-                    widget = cf_frame.ele(".ctp-checkbox-label", timeout=3)
-                    if widget:
-                        widget.click()
-                        log.info("  [DrissionPage] ✓ Widget clicked")
-                        dp.wait(4)
-                        continue
-                except Exception:
-                    pass
-
-            # Check for "Continue" button on the main page
+            if i % 5 == 0 and i > 0:
+                log.info(f"  [DrissionPage]   still verifying... ({i}s)")
+            dp.wait(1)
+        else:
+            log.warning("  [DrissionPage] ⚠ Auto-verify did not resolve in 40s")
             try:
-                continue_btn = dp.ele("text:Continue", timeout=5)
-                if continue_btn:
-                    log.info(f"  [DrissionPage] ✓ Clicking Continue button...")
-                    continue_btn.click()
-                    dp.wait(4)
-                    log.info(f"  [DrissionPage] Page after Continue: {dp.title}")
-                    continue
+                dp.get_screenshot(path=_ss("drission_ERR_verify_timeout"))
             except Exception:
                 pass
 
-            # No CF elements found — wait a bit more
-            log.info(f"  [DrissionPage] No CF element found (attempt {attempt}/3) — waiting...")
-            dp.wait(5)
+        # ── Click Continue button ─────────────────────────────────────────────
+        try:
+            btn = dp.ele("text:Continue", timeout=8)
+            if btn:
+                log.info("  [DrissionPage] Clicking Continue...")
+                btn.click()
+                dp.wait(3)
+                log.info(f"  [DrissionPage] Title after Continue: {dp.title}")
+            else:
+                log.info("  [DrissionPage] No Continue button (auto-redirected)")
+        except Exception as e:
+            log.info(f"  [DrissionPage] Continue click: {e}")
 
         # ── Extract Gdshare URL ───────────────────────────────────────────────
         log.info("  [DrissionPage] Extracting Gdshare URL...")
 
-        # Method 1: find by data-label attribute
+        # Method 1: data-label attribute
         try:
-            gd_el = dp.ele('[data-label="Gdshare"]', timeout=5)
-            if gd_el:
-                href = gd_el.attr("href") or ""
+            gd = dp.ele('[data-label="Gdshare"]', timeout=5)
+            if gd:
+                href = gd.attr("href") or ""
                 if href.startswith("http") and "gdshare" in href:
                     gdshare_url = href
                     log.info(f"  [DrissionPage] ✅ Gdshare from attr: {gdshare_url}")
         except Exception:
             pass
 
-        # Method 2: text search
+        # Method 2: text "Gdshare"
         if not gdshare_url:
             try:
-                gd_el = dp.ele("text:Gdshare", timeout=3)
-                if gd_el:
-                    href = gd_el.attr("href") or ""
+                gd = dp.ele("text:Gdshare", timeout=5)
+                if gd:
+                    href = gd.attr("href") or ""
                     if "gdshare" in href:
                         gdshare_url = href
                         log.info(f"  [DrissionPage] ✅ Gdshare from text: {gdshare_url}")
             except Exception:
                 pass
 
-        # Method 3: parse HTML
+        # Method 3: HTML regex
         if not gdshare_url:
             gdshare_url = _parse_gdshare(dp.html)
             if gdshare_url:
@@ -231,18 +191,15 @@ def _drission_get_gdshare(dl_url: str, anime_url: str) -> str | None:
 
         if not gdshare_url:
             log.error("  [DrissionPage] ❌ Gdshare not found")
-            # Save screenshot for debugging
             try:
-                ss_path = _ss("drission_ERR_no_gdshare")
-                dp.get_screenshot(path=ss_path)
-                log.info(f"  Screenshot: {ss_path}")
+                dp.get_screenshot(path=_ss("drission_ERR_no_gdshare"))
             except Exception:
                 pass
 
         dp.quit()
 
     except Exception as e:
-        log.error(f"  [DrissionPage] Error: {e}")
+        log.error(f"  [DrissionPage] Fatal error: {e}")
         try:
             dp.quit()
         except Exception:
@@ -296,7 +253,9 @@ async def fetch_m3u8(anime_url: str) -> str | None:
         links = page.get_by_text("Watch Online", exact=True)
         n = await links.count()
         if n == 0:
-            log.error("❌ No Watch Online links"); await browser.close(); return None
+            log.error("❌ No Watch Online links")
+            await browser.close()
+            return None
         await links.last.click(timeout=10000)
         await asyncio.sleep(5)
 
@@ -337,7 +296,9 @@ async def fetch_m3u8(anime_url: str) -> str | None:
                 pass
             video_frame = await _find_video_frame(page)
         else:
-            log.error("❌ Turnstile persists"); await browser.close(); return None
+            log.error("❌ Turnstile persists")
+            await browser.close()
+            return None
 
         log.info("  Waiting 10s for player to settle...")
         await asyncio.sleep(10)
@@ -361,8 +322,8 @@ async def fetch_m3u8(anime_url: str) -> str | None:
             try:
                 await video_frame.evaluate("""() => {
                     const v = document.querySelector('video');
-                    if (v) { v.muted = true; let p = v.play();
-                        if (p?.catch) p.catch(e => {}); }
+                    if (v) { v.muted = true; let pp = v.play();
+                        if (pp?.catch) pp.catch(e => {}); }
                 }""")
             except Exception:
                 pass
@@ -372,22 +333,26 @@ async def fetch_m3u8(anime_url: str) -> str | None:
                     if (v) {
                         const r = v.getBoundingClientRect();
                         v.dispatchEvent(new MouseEvent('click', {
-                            bubbles:true, clientX: r.left+r.width/2, clientY: r.top+r.height/2
+                            bubbles: true,
+                            clientX: r.left + r.width  / 2,
+                            clientY: r.top  + r.height / 2
                         }));
                     }
                 }""")
             except Exception:
                 pass
-            for sel in [".jw-icon-display",'[aria-label="Play"]',
-                        ".vjs-big-play-button",".plyr__control--overlaid","video"]:
+            for sel in [".jw-icon-display", '[aria-label="Play"]',
+                        ".vjs-big-play-button", ".plyr__control--overlaid", "video"]:
                 try:
                     el = video_frame.locator(sel).first
                     if await el.count() > 0:
-                        await el.click(force=True, timeout=2000); break
+                        await el.click(force=True, timeout=2000)
+                        break
                 except Exception:
                     continue
             try:
-                await asyncio.wait_for(m3u8_event.wait(), timeout=5); break
+                await asyncio.wait_for(m3u8_event.wait(), timeout=5)
+                break
             except asyncio.TimeoutError:
                 continue
 
@@ -395,9 +360,10 @@ async def fetch_m3u8(anime_url: str) -> str | None:
             try:
                 await asyncio.wait_for(m3u8_event.wait(), timeout=30)
             except asyncio.TimeoutError:
-                log.warning("⚠ Timeout"); await page.screenshot(path=_ss("ERR_m3u8_timeout"))
+                log.warning("⚠ Timeout")
+                await page.screenshot(path=_ss("ERR_m3u8_timeout"))
 
-        log.info(f"{'✅ m3u8: '+m3u8_url if m3u8_url else '❌ m3u8 not found'}")
+        log.info(f"{'✅ m3u8: ' + m3u8_url if m3u8_url else '❌ m3u8 not found'}")
         await browser.close()
     return m3u8_url
 
@@ -409,14 +375,15 @@ async def fetch_m3u8(anime_url: str) -> str | None:
 async def fetch_gdshare_url(anime_url: str,
                              target_episode: int = None) -> tuple[str | None, int]:
     """
-    Flow:
-      1. Playwright: load main page, extract download1 URL from DOM
-      2. Modify URL: 002.hindianimeszone.com/download1 → files.hindianimeszone.com/dl.php
-      3. DrissionPage: open modified URL, handle CF Continue button, extract Gdshare
+    Step 1 — Playwright: load main page, extract download1 URL from DOM
+             (Playwright is fine here — no CF on main anime page)
+    Step 2 — DrissionPage: open download1 URL with real Chrome
+             CF auto-verify passes → click Continue → extract Gdshare URL
     """
-    gdshare_url = None
-    episode_num = 0
+    episode_num   = 0
+    download1_url = None
 
+    # ── Step 1: Playwright — main page only ───────────────────────────────────
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=Config.HEADLESS,
@@ -428,25 +395,26 @@ async def fetch_gdshare_url(anime_url: str,
         )
         await Stealth().apply_stealth_async(context)
         page = await context.new_page()
+
         page.on("popup", lambda pop: asyncio.create_task(
             pop.close() if not pop.is_closed() else asyncio.sleep(0)
         ))
 
-        # ── Step 1: Main page ─────────────────────────────────────────────────
-        log.info(f"[480p] Opening: {anime_url}")
+        log.info(f"[480p] Opening main page: {anime_url}")
         await page.goto(anime_url, wait_until="domcontentloaded", timeout=60000)
         log.info(f"  title: {await page.title()}")
+
         try:
             await page.wait_for_selector('a:has-text("480p")', timeout=20000)
         except Exception:
             await asyncio.sleep(8)
 
-        # ── Step 2: Extract download1 URL from DOM ────────────────────────────
         link_data = await page.evaluate(r'''([ep]) => {
             const all480 = Array.from(document.querySelectorAll('a'))
                 .filter(a => a.textContent.trim().toLowerCase().includes("480p"));
             if (!all480.length) return {href:null, total:0, msg:"No 480p links"};
-            if (!ep) return {href:all480[all480.length-1].href, total:all480.length, msg:"Last"};
+            if (!ep) return {href:all480[all480.length-1].href,
+                             total:all480.length, msg:"Last"};
             const re = new RegExp("Episode\\s*0*"+ep+"\\b","i");
             for (let a of all480) {
                 let par=a.parentElement, hasEp=false, hasMulti=false;
@@ -455,7 +423,8 @@ async def fetch_gdshare_url(anime_url: str,
                     if ((t.match(/Episode\s*\d+/gi)||[]).length>3) break;
                     if (re.test(t)) hasEp=true;
                     if (/multi\s*audio/i.test(t)) hasMulti=true;
-                    if (hasEp&&hasMulti) return {href:a.href,total:all480.length,msg:`Ep${ep}+Multi`};
+                    if (hasEp&&hasMulti) return {href:a.href, total:all480.length,
+                                                  msg:`Ep${ep}+Multi`};
                     par=par.parentElement;
                 }
             }
@@ -464,7 +433,8 @@ async def fetch_gdshare_url(anime_url: str,
                 for (let i=0;i<6&&par;i++) {
                     const t=par.textContent;
                     if ((t.match(/Episode\s*\d+/gi)||[]).length>3) break;
-                    if (re.test(t)) return {href:a.href,total:all480.length,msg:`Ep${ep} no-multi`};
+                    if (re.test(t)) return {href:a.href, total:all480.length,
+                                             msg:`Ep${ep} no-multi`};
                     par=par.parentElement;
                 }
             }
@@ -476,29 +446,17 @@ async def fetch_gdshare_url(anime_url: str,
         log.info(f"  DOM: {link_data.get('msg')} | total={episode_num}")
         await browser.close()
 
-        if not download1_url:
-            log.error("❌ No download1 URL found in DOM")
-            return None, episode_num
+    if not download1_url:
+        log.error("❌ No download1 URL found")
+        return None, episode_num
 
-        log.info(f"  Original URL: {download1_url}")
+    log.info(f"  download1 URL: {download1_url}")
 
-        # ── Step 3: Modify URL ────────────────────────────────────────────────
-        modified_url = _modify_download1_url(download1_url)
-        log.info(f"  Modified URL: {modified_url}")
-
-    # ── Step 4: DrissionPage handles CF Continue + Gdshare extraction ─────────
-    # Run in executor so it doesn't block the async event loop
-    loop = asyncio.get_event_loop()
+    # ── Step 2: DrissionPage — CF auto-verify + Continue + Gdshare ───────────
+    loop        = asyncio.get_event_loop()
     gdshare_url = await loop.run_in_executor(
-        None, _drission_get_gdshare, modified_url, anime_url
+        None, _drission_get_gdshare, download1_url
     )
-
-    # ── Fallback: try original download1 URL if modified URL failed ───────────
-    if not gdshare_url and modified_url != download1_url:
-        log.warning("  Modified URL failed — trying original URL with DrissionPage...")
-        gdshare_url = await loop.run_in_executor(
-            None, _drission_get_gdshare, download1_url, anime_url
-        )
 
     log.info(f"[480p] Final GDShare URL: {gdshare_url}")
     return gdshare_url, episode_num
