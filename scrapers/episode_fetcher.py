@@ -128,21 +128,7 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
         # ── Wait for CF auto-verify to resolve ────────────────────────────────
         # "Verifying..." spinner resolves on its own with real Chrome fingerprint.
         # Poll until "Verifying..." text disappears from the page.
-        log.info("  [DrissionPage] Waiting for CF auto-verify to resolve...")
-        for i in range(40):
-            html_lower = dp.html.lower()
-            if "verifying" not in html_lower:
-                log.info(f"  [DrissionPage] ✅ Auto-verify resolved in ~{i}s")
-                break
-            if i % 5 == 0 and i > 0:
-                log.info(f"  [DrissionPage]   still verifying... ({i}s)")
-            dp.wait(1)
-        else:
-            log.warning("  [DrissionPage] ⚠ Auto-verify did not resolve in 40s")
-            try:
-                dp.get_screenshot(path=_ss("drission_ERR_verify_timeout"))
-            except Exception:
-                pass
+        
 
         # ── Click Continue button ─────────────────────────────────────────────
         try:
@@ -158,6 +144,36 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
             log.info(f"  [DrissionPage] Continue click: {e}")
 
         # ── Extract Gdshare URL ───────────────────────────────────────────────
+              # ── Wait for CF auto-verify to resolve ────────────────────────────────
+        log.info("  [DrissionPage] Waiting for CF auto-verify to resolve...")
+        for i in range(40):
+            title_lower = dp.title.lower()
+            
+            # Check the title for common Cloudflare challenge keywords
+            if "verify" not in title_lower and "just a moment" not in title_lower and "cloudflare" not in title_lower:
+                log.info(f"  [DrissionPage] ✅ Auto-verify resolved in ~{i}s (New Title: {dp.title})")
+                break
+
+            # Attempt to click the Turnstile checkbox if it requires interaction
+            try:
+                cf_iframe = dp.get_frame('@src^https://challenges.cloudflare.com')
+                if cf_iframe:
+                    # Look for the interactive challenge element inside the iframe
+                    challenge_box = cf_iframe.ele('.cb-c', timeout=0.5) or cf_iframe.ele('#challenge-stage', timeout=0.5)
+                    if challenge_box:
+                        challenge_box.click(by_js=True)
+            except Exception:
+                pass # Ignore errors if the iframe or box isn't found/clickable yet
+
+            if i % 5 == 0 and i > 0:
+                log.info(f"  [DrissionPage]   still verifying... ({i}s) [Title: {dp.title}]")
+            dp.wait(1)
+        else:
+            log.warning("  [DrissionPage] ⚠ Auto-verify did not resolve in 40s")
+            try:
+                dp.get_screenshot(path=_ss("drission_ERR_verify_timeout"))
+            except Exception:
+                pass
         log.info("  [DrissionPage] Extracting Gdshare URL...")
 
         # Method 1: data-label attribute
