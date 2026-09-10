@@ -1,12 +1,11 @@
 """
 episode_fetcher.py
 ──────────────────
-Fixes for Koyeb VPS 403:
-  1. Dockerfile: official Playwright image (all Chrome deps pre-installed)
-  2. context.request.get() → 403 on datacenter IPs because it uses Playwright's
-     internal HTTP client (not Chrome TLS). Fix: block CF Turnstile iframe via
-     page.route() → navigate download1 normally → Turnstile UI never loads →
-     page content (Gdshare link) is accessible directly.
+MODE 1  fetch_m3u8()        — intercept master.m3u8 from video player
+MODE 2  fetch_gdshare_url() — get Gdshare URL via:
+          1. Playwright → main page → extract download1 URL
+          2. Modify URL: 002.hindianimeszone.com/download1 → files.hindianimeszone.com/dl.php
+          3. DrissionPage → navigate modified URL → handle CF "Continue" button → get Gdshare
 """
 import asyncio
 import logging
@@ -33,7 +32,20 @@ def _ss(name: str) -> str:
     return str(_SS_DIR / f"{ts}_{name}.png")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── URL modifier ──────────────────────────────────────────────────────────────
+
+def _modify_download1_url(url: str) -> str:
+    """
+    Convert:  https://002.hindianimeszone.com/download1[.php]?...
+    To:       https://files.hindianimeszone.com/dl.php?...
+    This subdomain has a simpler CF check (Continue button, 1hr valid).
+    """
+    url = re.sub(r'https://[^.]+\.', 'https://files.', url)
+    url = re.sub(r'/download1(?:\.php)?', '/dl.php', url)
+    return url
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
 async def _has_turnstile(page) -> bool:
     for frame in page.frames:
@@ -63,24 +75,180 @@ async def _find_video_frame(page):
                 log.info(f"  ✓ Found video frame via URL: {frame.url[:60]}")
                 break
     if not video_frame:
-        log.info("  ⚠ Using main page as fallback frame")
         video_frame = page
     return video_frame
 
 
 def _parse_gdshare(html: str) -> str | None:
-    """Extract Gdshare URL from download1 page HTML."""
-    patterns = [
+    for pat in [
         r'href=["\']?(https://gdshare\.top/download/[^"\'>\s]+)',
         r'data-label=["\']Gdshare["\'][^>]*href=["\']([^"\']+)["\']',
         r'href=["\']([^"\']+)["\'][^>]*data-label=["\']Gdshare["\']',
         r'(https://gdshare\.top/[^\s"\'<>]+)',
-    ]
-    for pat in patterns:
+    ]:
         m = re.search(pat, html)
         if m:
             return m.group(1)
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DrissionPage handler for files.hindianimeszone.com/dl.php
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _drission_get_gdshare(dl_url: str, anime_url: str) -> str | None:
+    """
+    Uses DrissionPage (real Chrome, better CF bypass) to:
+      1. Open files.hindianimeszone.com/dl.php URL
+      2. Detect "Verify You're Human" / "Continue" button
+      3. Click the CF Turnstile checkbox (inside iframe)
+      4. Click Continue button
+      5. Extract Gdshare URL from page
+
+    DrissionPage passes CF more reliably because it uses the actual
+    installed Chrome binary with a real profile fingerprint.
+
+    Returns: gdshare URL string or None
+    """
+    try:
+        from DrissionPage import ChromiumPage, ChromiumOptions
+    except ImportError:
+        log.error("DrissionPage not installed — pip install DrissionPage")
+        return None
+
+    gdshare_url = None
+
+    try:
+        co = ChromiumOptions()
+        co.headless(Config.HEADLESS)
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-dev-shm-usage")
+        co.set_argument("--disable-blink-features=AutomationControlled")
+
+        if Config.PROXY_URL:
+            co.set_proxy(Config.PROXY_URL)
+            log.info(f"  [DrissionPage] Using proxy: {Config.PROXY_URL[:30]}...")
+
+        dp = ChromiumPage(addr_or_opts=co)
+
+        log.info(f"  [DrissionPage] Navigating: {dl_url}")
+        dp.get(dl_url)
+        dp.wait(4)
+
+        log.info(f"  [DrissionPage] Page title: {dp.title}")
+
+        # ── Handle Cloudflare Turnstile checkbox (inside CF iframe) ──────────
+        # DrissionPage can find elements inside iframes easily
+        for attempt in range(1, 4):
+            page_text = dp.html.lower()
+
+            # Check if we're past CF already (Gdshare link visible)
+            if "gdshare" in page_text or "data-label" in page_text:
+                log.info(f"  [DrissionPage] CF passed — content visible")
+                break
+
+            # Check for Turnstile iframe
+            cf_frame = None
+            for frame in dp.get_frames():
+                try:
+                    if "challenges.cloudflare.com" in frame.url:
+                        cf_frame = frame
+                        break
+                except Exception:
+                    pass
+
+            if cf_frame:
+                log.info(f"  [DrissionPage] CF Turnstile iframe found (attempt {attempt}/3)")
+                try:
+                    # Click the checkbox inside the iframe
+                    checkbox = cf_frame.ele("xpath://input[@type='checkbox']", timeout=5)
+                    if checkbox:
+                        checkbox.click()
+                        log.info("  [DrissionPage] ✓ Checkbox clicked")
+                        dp.wait(4)
+                        continue
+                except Exception:
+                    pass
+
+                try:
+                    # Alternative: click the widget div itself
+                    widget = cf_frame.ele(".ctp-checkbox-label", timeout=3)
+                    if widget:
+                        widget.click()
+                        log.info("  [DrissionPage] ✓ Widget clicked")
+                        dp.wait(4)
+                        continue
+                except Exception:
+                    pass
+
+            # Check for "Continue" button on the main page
+            try:
+                continue_btn = dp.ele("text:Continue", timeout=5)
+                if continue_btn:
+                    log.info(f"  [DrissionPage] ✓ Clicking Continue button...")
+                    continue_btn.click()
+                    dp.wait(4)
+                    log.info(f"  [DrissionPage] Page after Continue: {dp.title}")
+                    continue
+            except Exception:
+                pass
+
+            # No CF elements found — wait a bit more
+            log.info(f"  [DrissionPage] No CF element found (attempt {attempt}/3) — waiting...")
+            dp.wait(5)
+
+        # ── Extract Gdshare URL ───────────────────────────────────────────────
+        log.info("  [DrissionPage] Extracting Gdshare URL...")
+
+        # Method 1: find by data-label attribute
+        try:
+            gd_el = dp.ele('[data-label="Gdshare"]', timeout=5)
+            if gd_el:
+                href = gd_el.attr("href") or ""
+                if href.startswith("http") and "gdshare" in href:
+                    gdshare_url = href
+                    log.info(f"  [DrissionPage] ✅ Gdshare from attr: {gdshare_url}")
+        except Exception:
+            pass
+
+        # Method 2: text search
+        if not gdshare_url:
+            try:
+                gd_el = dp.ele("text:Gdshare", timeout=3)
+                if gd_el:
+                    href = gd_el.attr("href") or ""
+                    if "gdshare" in href:
+                        gdshare_url = href
+                        log.info(f"  [DrissionPage] ✅ Gdshare from text: {gdshare_url}")
+            except Exception:
+                pass
+
+        # Method 3: parse HTML
+        if not gdshare_url:
+            gdshare_url = _parse_gdshare(dp.html)
+            if gdshare_url:
+                log.info(f"  [DrissionPage] ✅ Gdshare from HTML: {gdshare_url}")
+
+        if not gdshare_url:
+            log.error("  [DrissionPage] ❌ Gdshare not found")
+            # Save screenshot for debugging
+            try:
+                ss_path = _ss("drission_ERR_no_gdshare")
+                dp.get_screenshot(path=ss_path)
+                log.info(f"  Screenshot: {ss_path}")
+            except Exception:
+                pass
+
+        dp.quit()
+
+    except Exception as e:
+        log.error(f"  [DrissionPage] Error: {e}")
+        try:
+            dp.quit()
+        except Exception:
+            pass
+
+    return gdshare_url
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,7 +294,7 @@ async def fetch_m3u8(anime_url: str) -> str | None:
 
         log.info("[2/4] Clicking last Watch Online...")
         links = page.get_by_text("Watch Online", exact=True)
-        n     = await links.count()
+        n = await links.count()
         if n == 0:
             log.error("❌ No Watch Online links"); await browser.close(); return None
         await links.last.click(timeout=10000)
@@ -169,7 +337,7 @@ async def fetch_m3u8(anime_url: str) -> str | None:
                 pass
             video_frame = await _find_video_frame(page)
         else:
-            log.error("❌ Turnstile persists — try Mode 2"); await browser.close(); return None
+            log.error("❌ Turnstile persists"); await browser.close(); return None
 
         log.info("  Waiting 10s for player to settle...")
         await asyncio.sleep(10)
@@ -241,16 +409,10 @@ async def fetch_m3u8(anime_url: str) -> str | None:
 async def fetch_gdshare_url(anime_url: str,
                              target_episode: int = None) -> tuple[str | None, int]:
     """
-    VPS/Koyeb-safe flow — no Turnstile:
-
-    Step 1: Load main anime page (no CF on this domain)
-    Step 2: Extract download1 URL from DOM (no navigation)
-    Step 3: Open download1 in the SAME page but with CF challenge BLOCKED via
-            page.route() — Turnstile iframe is aborted before it loads,
-            so the challenge never appears. The download1 page content
-            (Gdshare link) is accessible underneath.
-    Step 4: Parse Gdshare URL from page HTML/DOM
-    Fallback: context.request.get() if route approach returns no link
+    Flow:
+      1. Playwright: load main page, extract download1 URL from DOM
+      2. Modify URL: 002.hindianimeszone.com/download1 → files.hindianimeszone.com/dl.php
+      3. DrissionPage: open modified URL, handle CF Continue button, extract Gdshare
     """
     gdshare_url = None
     episode_num = 0
@@ -266,12 +428,11 @@ async def fetch_gdshare_url(anime_url: str,
         )
         await Stealth().apply_stealth_async(context)
         page = await context.new_page()
-
         page.on("popup", lambda pop: asyncio.create_task(
             pop.close() if not pop.is_closed() else asyncio.sleep(0)
         ))
 
-        # ── Step 1: Main page (no CF) ─────────────────────────────────────────
+        # ── Step 1: Main page ─────────────────────────────────────────────────
         log.info(f"[480p] Opening: {anime_url}")
         await page.goto(anime_url, wait_until="domcontentloaded", timeout=60000)
         log.info(f"  title: {await page.title()}")
@@ -313,105 +474,31 @@ async def fetch_gdshare_url(anime_url: str,
         episode_num   = link_data.get("total", 0)
         download1_url = link_data.get("href")
         log.info(f"  DOM: {link_data.get('msg')} | total={episode_num}")
+        await browser.close()
 
         if not download1_url:
-            log.error("❌ No download1 URL"); await browser.close(); return None, episode_num
+            log.error("❌ No download1 URL found in DOM")
+            return None, episode_num
 
-        log.info(f"  download1: {download1_url}")
+        log.info(f"  Original URL: {download1_url}")
 
+        # ── Step 3: Modify URL ────────────────────────────────────────────────
+        modified_url = _modify_download1_url(download1_url)
+        log.info(f"  Modified URL: {modified_url}")
 
-        # --- NEW URL MODIFICATION LOGIC ---
-        # 1. Replace the subdomain (e.g., '002') with 'files'
-        download1_url = re.sub(r'https://[^.]+\.', 'https://files.', download1_url)
-        
-        # 2. Safely replace '/download1' OR '/download1.php' with '/dl.php'
-        download1_url = re.sub(r'/download1(?:\.php)?', '/dl.php', download1_url)
-        # ----------------------------------
-      
-        # ── Step 3: Block CF Turnstile then navigate to download1 ─────────────
-        # KEY FIX for VPS 403:
-        # We abort ALL requests to challenges.cloudflare.com BEFORE navigating.
-        # Result: the Turnstile iframe never loads → no challenge shown →
-        # the download1 page content renders normally with Gdshare link visible.
-        log.info("  Routing: blocking CF challenge scripts...")
+    # ── Step 4: DrissionPage handles CF Continue + Gdshare extraction ─────────
+    # Run in executor so it doesn't block the async event loop
+    loop = asyncio.get_event_loop()
+    gdshare_url = await loop.run_in_executor(
+        None, _drission_get_gdshare, modified_url, anime_url
+    )
 
-        async def _block_cf(route):
-            await route.abort()
+    # ── Fallback: try original download1 URL if modified URL failed ───────────
+    if not gdshare_url and modified_url != download1_url:
+        log.warning("  Modified URL failed — trying original URL with DrissionPage...")
+        gdshare_url = await loop.run_in_executor(
+            None, _drission_get_gdshare, download1_url, anime_url
+        )
 
-        await page.route("**challenges.cloudflare.com**", _block_cf)
-        await page.route("**cf-turnstile**", _block_cf)
-
-        log.info("  Navigating to download1 (CF challenge blocked)...")
-        try:
-            await page.goto(download1_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            log.info(f"  Nav warning (ok): {e}")
-
-        await asyncio.sleep(3)
-        log.info(f"  title: {await page.title()}")
-
-        # Check that Turnstile is actually gone
-        if await _has_turnstile(page):
-            log.warning("  Turnstile still present even with route blocking")
-            await page.screenshot(path=_ss("480_turnstile_persists"))
-
-        # ── Step 4a: Try DOM selector first ──────────────────────────────────
-        gdshare_el = page.locator('a[data-label="Gdshare"]')
-        gd_count   = await gdshare_el.count()
-        log.info(f"  Gdshare elements: {gd_count}")
-
-        if gd_count > 0:
-            href = await gdshare_el.first.get_attribute("href") or ""
-            if href.startswith("http") and "gdshare" in href:
-                gdshare_url = href
-                log.info(f"  ✅ Gdshare from DOM attr: {gdshare_url}")
-            else:
-                try:
-                    async with context.expect_page(timeout=8000) as gp_info:
-                        await gdshare_el.first.click()
-                    gp = await gp_info.value
-                    await asyncio.sleep(2)
-                    gdshare_url = gp.url
-                    await gp.close()
-                    log.info(f"  ✅ Gdshare from tab: {gdshare_url}")
-                except Exception as e:
-                    log.warning(f"  Tab capture failed: {e}")
-
-        # ── Step 4b: Fallback — parse raw HTML ────────────────────────────────
-        if not gdshare_url:
-            log.info("  Parsing Gdshare from page HTML...")
-            html       = await page.content()
-            gdshare_url = _parse_gdshare(html)
-            if gdshare_url:
-                log.info(f"  ✅ Gdshare from HTML regex: {gdshare_url}")
-
-        # ── Step 4c: Fallback — context.request (works on non-VPS) ───────────
-        if not gdshare_url:
-            log.info("  Fallback: context.request.get()...")
-            try:
-                resp = await context.request.get(
-                    download1_url,
-                    headers={
-                        "Accept":         "text/html,*/*;q=0.8",
-                        "Accept-Language":"en-US,en;q=0.9",
-                        "Referer":        anime_url,
-                        "User-Agent":     UA,
-                    },
-                )
-                log.info(f"  context.request status: {resp.status}")
-                if resp.ok:
-                    gdshare_url = _parse_gdshare(await resp.text())
-                    if gdshare_url:
-                        log.info(f"  ✅ Gdshare from request: {gdshare_url}")
-            except Exception as e:
-                log.warning(f"  context.request failed: {e}")
-
-        if not gdshare_url:
-            log.error("❌ Could not extract Gdshare URL by any method")
-            await page.screenshot(path=_ss("ERR_no_gdshare"))
-
-        log.info(f"[480p] Final: {gdshare_url}")
-        await browser.close()
-        log.info("  Browser closed ✓")
-
+    log.info(f"[480p] Final GDShare URL: {gdshare_url}")
     return gdshare_url, episode_num
