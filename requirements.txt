@@ -1,3 +1,4 @@
+tzdata
 # Telegram
 pyrofork
 tgcrypto
