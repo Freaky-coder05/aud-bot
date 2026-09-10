@@ -10,6 +10,7 @@ class Config:
     API_HASH     = os.getenv("API_HASH", "a5dc7fec8302615f5b441ec5e238cd46")
     BOT_TOKEN    = os.getenv("BOT_TOKEN", "7722665729:AAEVKhEE8bwXnF6P0j1aGCVeBwgkypfS_OM")
     USER_SESSION = os.getenv("USER_SESSION", "false")
+    PROXY_URL = ""
 
     # ── Channels ──────────────────────────────────────────────────────────────
     SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@HindiAnimeZonecom")
