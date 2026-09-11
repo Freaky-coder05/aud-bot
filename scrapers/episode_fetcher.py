@@ -2,15 +2,14 @@
 episode_fetcher.py
 ──────────────────
 MODE 1  fetch_m3u8()        — Playwright → intercept master.m3u8
-MODE 2  fetch_gdshare_url() — Playwright → main page → extract download1 URL
-                              DrissionPage → download1 → CF auto-verify passes
-                              (real Chrome fingerprint) → click Continue → Gdshare URL
+MODE 2  fetch_gdshare_url() — Playwright → main page → download1 URL
+                              DrissionPage → CF auto-verify → Continue → Gdshare
 
-WHY DrissionPage for download1:
-  On VPS/Koyeb, CF auto-verify ("Verifying...") detects Playwright's Chromium
-  as a bot and never resolves. DrissionPage uses the real installed Chrome binary
-  with a full fingerprint (fonts, GPU, profile) so CF auto-verify passes cleanly,
-  then we just click Continue.
+BUG FIXED:
+  Old check: "verifying" not in dp.html  → always True (iframe not in html)
+  New check: "verify" not in dp.title    → reliable, title stays "Verify - I'm not a robot"
+             until CF actually passes, then changes to the real download page title.
+  Strategy:  keep clicking Continue every 2s until title changes away from verify page.
 """
 import asyncio
 import logging
@@ -31,6 +30,7 @@ UA = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+
 _SS_DIR = Path(Config.SCREENSHOT_DIR)
 
 
@@ -38,6 +38,25 @@ def _ss(name: str) -> str:
     _SS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S")
     return str(_SS_DIR / f"{ts}_{name}.png")
+
+
+def _on_verify_page(dp) -> bool:
+    """True if DrissionPage is still on the Cloudflare verify page."""
+    title = dp.title.lower()
+    return "verify" in title or "robot" in title or "i'm not a robot" in title
+
+
+def _parse_gdshare(html: str) -> str | None:
+    for pat in [
+        r'href=["\']?(https://gdshare\.top/download/[^"\'>\s]+)',
+        r'data-label=["\']Gdshare["\'][^>]*href=["\']([^"\']+)["\']',
+        r'href=["\']([^"\']+)["\'][^>]*data-label=["\']Gdshare["\']',
+        r'(https://gdshare\.top/[^\s"\'<>]+)',
+    ]:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -74,37 +93,29 @@ async def _find_video_frame(page):
     return video_frame
 
 
-def _parse_gdshare(html: str) -> str | None:
-    for pat in [
-        r'href=["\']?(https://gdshare\.top/download/[^"\'>\s]+)',
-        r'data-label=["\']Gdshare["\'][^>]*href=["\']([^"\']+)["\']',
-        r'href=["\']([^"\']+)["\'][^>]*data-label=["\']Gdshare["\']',
-        r'(https://gdshare\.top/[^\s"\'<>]+)',
-    ]:
-        m = re.search(pat, html)
-        if m:
-            return m.group(1)
-    return None
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# DrissionPage — handles download1 CF auto-verify + Continue + Gdshare extract
+# DrissionPage — CF auto-verify + Continue + Gdshare
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _drission_get_gdshare(download1_url: str) -> str | None:
     """
-    Uses DrissionPage (real Chrome) to:
-      1. Open download1 URL
-      2. Wait for CF "Verifying..." to auto-resolve (passes because real Chrome)
-      3. Click Continue button
-      4. Extract Gdshare URL from the download page
+    DrissionPage (real Chrome) handles the CF "Verify - I'm not a robot" page:
 
-    This is a blocking function — called via run_in_executor from async context.
+    Detection (FIXED):
+      Old: "verifying" not in dp.html  ← WRONG, iframe content not in html
+      New: dp.title checks             ← CORRECT, title stays "Verify - I'm not a robot"
+                                          until CF actually verifies
+
+    Strategy:
+      - Wait up to 40s for title to change away from verify page
+      - Keep clicking Continue every 2s (works once CF passes)
+      - Once title changes → we're on the real download page
+      - Extract Gdshare URL
     """
     try:
         from DrissionPage import ChromiumPage, ChromiumOptions
     except ImportError:
-        log.error("[DrissionPage] Not installed — run: pip install DrissionPage")
+        log.error("[DrissionPage] Not installed — pip install DrissionPage")
         return None
 
     gdshare_url = None
@@ -116,64 +127,56 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
         co.set_argument("--disable-dev-shm-usage")
         co.set_argument("--disable-blink-features=AutomationControlled")
 
-        
+        if getattr(Config, "PROXY_URL", ""):
+            co.set_proxy(Config.PROXY_URL)
+            log.info(f"  [DrissionPage] Proxy: {Config.PROXY_URL[:40]}")
 
         dp = ChromiumPage(addr_or_opts=co)
 
         # ── Navigate ──────────────────────────────────────────────────────────
         log.info(f"  [DrissionPage] Opening: {download1_url}")
         dp.get(download1_url)
-        log.info(f"  [DrissionPage] Title: {dp.title}")
+        dp.wait(2)
+        log.info(f"  [DrissionPage] Initial title: {dp.title}")
 
-        # ── Wait for CF auto-verify to resolve ────────────────────────────────
-        # "Verifying..." spinner resolves on its own with real Chrome fingerprint.
-        # Poll until "Verifying..." text disappears from the page.
-        
+        # ── Wait for CF to pass + click Continue ──────────────────────────────
+        # FIXED: check title, not dp.html (html doesn't include iframe content)
+        # CF keeps title as "Verify - I'm not a robot" until it passes.
+        # We click Continue every 2s — it only works once CF has actually verified.
+        # Once CF passes, Continue redirects to the real page and title changes.
 
-        # ── Click Continue button ─────────────────────────────────────────────
-        try:
-            btn = dp.ele("text:Continue", timeout=8)
-            if btn:
-                log.info("  [DrissionPage] Clicking Continue...")
-                btn.click()
-                dp.wait(3)
-                log.info(f"  [DrissionPage] Title after Continue: {dp.title}")
+        if _on_verify_page(dp):
+            log.info("  [DrissionPage] CF verify page detected — waiting to pass...")
+
+            for i in range(40):
+                if not _on_verify_page(dp):
+                    log.info(f"  [DrissionPage] ✅ CF passed in ~{i*2}s — title: {dp.title}")
+                    break
+
+                # Click Continue (no-op until CF verifies, then it works)
+                try:
+                    btn = dp.ele("text:Continue", timeout=2)
+                    if btn:
+                        btn.click()
+                        log.info(f"  [DrissionPage]   [{i*2}s] Continue clicked — "
+                                 f"title: {dp.title}")
+                except Exception:
+                    pass
+
+                dp.wait(2)
             else:
-                log.info("  [DrissionPage] No Continue button (auto-redirected)")
-        except Exception as e:
-            log.info(f"  [DrissionPage] Continue click: {e}")
+                log.error("  [DrissionPage] ❌ CF verify did not pass in 80s")
+                try:
+                    dp.get_screenshot(path=_ss("drission_ERR_verify_timeout"))
+                except Exception:
+                    pass
+                dp.quit()
+                return None
+        else:
+            log.info(f"  [DrissionPage] No verify page — direct access, title: {dp.title}")
 
         # ── Extract Gdshare URL ───────────────────────────────────────────────
-              # ── Wait for CF auto-verify to resolve ────────────────────────────────
-        log.info("  [DrissionPage] Waiting for CF auto-verify to resolve...")
-        for i in range(40):
-            title_lower = dp.title.lower()
-            
-            # Check the title for common Cloudflare challenge keywords
-            if "verify" not in title_lower and "just a moment" not in title_lower and "cloudflare" not in title_lower:
-                log.info(f"  [DrissionPage] ✅ Auto-verify resolved in ~{i}s (New Title: {dp.title})")
-                break
-
-            # Attempt to click the Turnstile checkbox if it requires interaction
-            try:
-                cf_iframe = dp.get_frame('@src^https://challenges.cloudflare.com')
-                if cf_iframe:
-                    # Look for the interactive challenge element inside the iframe
-                    challenge_box = cf_iframe.ele('.cb-c', timeout=0.5) or cf_iframe.ele('#challenge-stage', timeout=0.5)
-                    if challenge_box:
-                        challenge_box.click(by_js=True)
-            except Exception:
-                pass # Ignore errors if the iframe or box isn't found/clickable yet
-
-            if i % 5 == 0 and i > 0:
-                log.info(f"  [DrissionPage]   still verifying... ({i}s) [Title: {dp.title}]")
-            dp.wait(1)
-        else:
-            log.warning("  [DrissionPage] ⚠ Auto-verify did not resolve in 40s")
-            try:
-                dp.get_screenshot(path=_ss("drission_ERR_verify_timeout"))
-            except Exception:
-                pass
+        log.info(f"  [DrissionPage] On download page: {dp.title}")
         log.info("  [DrissionPage] Extracting Gdshare URL...")
 
         # Method 1: data-label attribute
@@ -183,7 +186,7 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
                 href = gd.attr("href") or ""
                 if href.startswith("http") and "gdshare" in href:
                     gdshare_url = href
-                    log.info(f"  [DrissionPage] ✅ Gdshare from attr: {gdshare_url}")
+                    log.info(f"  [DrissionPage] ✅ Gdshare attr: {gdshare_url}")
         except Exception:
             pass
 
@@ -195,7 +198,7 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
                     href = gd.attr("href") or ""
                     if "gdshare" in href:
                         gdshare_url = href
-                        log.info(f"  [DrissionPage] ✅ Gdshare from text: {gdshare_url}")
+                        log.info(f"  [DrissionPage] ✅ Gdshare text: {gdshare_url}")
             except Exception:
                 pass
 
@@ -203,10 +206,10 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
         if not gdshare_url:
             gdshare_url = _parse_gdshare(dp.html)
             if gdshare_url:
-                log.info(f"  [DrissionPage] ✅ Gdshare from HTML: {gdshare_url}")
+                log.info(f"  [DrissionPage] ✅ Gdshare HTML: {gdshare_url}")
 
         if not gdshare_url:
-            log.error("  [DrissionPage] ❌ Gdshare not found")
+            log.error(f"  [DrissionPage] ❌ Gdshare not found — title: {dp.title}")
             try:
                 dp.get_screenshot(path=_ss("drission_ERR_no_gdshare"))
             except Exception:
@@ -215,7 +218,7 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
         dp.quit()
 
     except Exception as e:
-        log.error(f"  [DrissionPage] Fatal error: {e}")
+        log.error(f"  [DrissionPage] Fatal: {e}")
         try:
             dp.quit()
         except Exception:
@@ -391,15 +394,13 @@ async def fetch_m3u8(anime_url: str) -> str | None:
 async def fetch_gdshare_url(anime_url: str,
                              target_episode: int = None) -> tuple[str | None, int]:
     """
-    Step 1 — Playwright: load main page, extract download1 URL from DOM
-             (Playwright is fine here — no CF on main anime page)
-    Step 2 — DrissionPage: open download1 URL with real Chrome
-             CF auto-verify passes → click Continue → extract Gdshare URL
+    Step 1: Playwright → main page → extract download1 URL from DOM
+    Step 2: DrissionPage → download1 → CF verify → Continue → Gdshare URL
     """
     episode_num   = 0
     download1_url = None
 
-    # ── Step 1: Playwright — main page only ───────────────────────────────────
+    # ── Step 1: Playwright ────────────────────────────────────────────────────
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=Config.HEADLESS,
@@ -439,7 +440,7 @@ async def fetch_gdshare_url(anime_url: str,
                     if ((t.match(/Episode\s*\d+/gi)||[]).length>3) break;
                     if (re.test(t)) hasEp=true;
                     if (/multi\s*audio/i.test(t)) hasMulti=true;
-                    if (hasEp&&hasMulti) return {href:a.href, total:all480.length,
+                    if (hasEp&&hasMulti) return {href:a.href,total:all480.length,
                                                   msg:`Ep${ep}+Multi`};
                     par=par.parentElement;
                 }
@@ -449,7 +450,7 @@ async def fetch_gdshare_url(anime_url: str,
                 for (let i=0;i<6&&par;i++) {
                     const t=par.textContent;
                     if ((t.match(/Episode\s*\d+/gi)||[]).length>3) break;
-                    if (re.test(t)) return {href:a.href, total:all480.length,
+                    if (re.test(t)) return {href:a.href,total:all480.length,
                                              msg:`Ep${ep} no-multi`};
                     par=par.parentElement;
                 }
@@ -468,7 +469,7 @@ async def fetch_gdshare_url(anime_url: str,
 
     log.info(f"  download1 URL: {download1_url}")
 
-    # ── Step 2: DrissionPage — CF auto-verify + Continue + Gdshare ───────────
+    # ── Step 2: DrissionPage ──────────────────────────────────────────────────
     loop        = asyncio.get_event_loop()
     gdshare_url = await loop.run_in_executor(
         None, _drission_get_gdshare, download1_url
