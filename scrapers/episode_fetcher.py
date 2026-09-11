@@ -96,21 +96,13 @@ async def _find_video_frame(page):
 # ══════════════════════════════════════════════════════════════════════════════
 # DrissionPage — CF auto-verify + Continue + Gdshare
 # ══════════════════════════════════════════════════════════════════════════════
-
 def _drission_get_gdshare(download1_url: str) -> str | None:
     """
-    DrissionPage (real Chrome) handles the CF "Verify - I'm not a robot" page:
-
-    Detection (FIXED):
-      Old: "verifying" not in dp.html  ← WRONG, iframe content not in html
-      New: dp.title checks             ← CORRECT, title stays "Verify - I'm not a robot"
-                                          until CF actually verifies
-
-    Strategy:
-      - Wait up to 40s for title to change away from verify page
-      - Keep clicking Continue every 2s (works once CF passes)
-      - Once title changes → we're on the real download page
-      - Extract Gdshare URL
+    FIXED ORDER:
+      1. Navigate
+      2. Check if on verify page by TITLE (reliable)
+      3. Loop: try clicking Continue every 2s until title changes (CF passed)
+      4. Only THEN extract Gdshare URL
     """
     try:
         from DrissionPage import ChromiumPage, ChromiumOptions
@@ -129,54 +121,56 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
 
         if getattr(Config, "PROXY_URL", ""):
             co.set_proxy(Config.PROXY_URL)
-            log.info(f"  [DrissionPage] Proxy: {Config.PROXY_URL[:40]}")
 
         dp = ChromiumPage(addr_or_opts=co)
 
-        # ── Navigate ──────────────────────────────────────────────────────────
+        # ── Step 1: Navigate ──────────────────────────────────────────────────
         log.info(f"  [DrissionPage] Opening: {download1_url}")
         dp.get(download1_url)
         dp.wait(2)
         log.info(f"  [DrissionPage] Initial title: {dp.title}")
 
-        # ── Wait for CF to pass + click Continue ──────────────────────────────
-        # FIXED: check title, not dp.html (html doesn't include iframe content)
-        # CF keeps title as "Verify - I'm not a robot" until it passes.
-        # We click Continue every 2s — it only works once CF has actually verified.
-        # Once CF passes, Continue redirects to the real page and title changes.
+        # ── Step 2 + 3: Wait for CF → keep clicking Continue ──────────────────
+        # Title stays "Verify - I'm not a robot" until CF auto-verify completes.
+        # We click Continue every 2s — it's a no-op until CF passes,
+        # then it works and the title changes to the real download page.
+        # DO NOT click Continue before this loop — it will always fail.
 
-        if _on_verify_page(dp):
-            log.info("  [DrissionPage] CF verify page detected — waiting to pass...")
+        def _on_verify_page() -> bool:
+            t = dp.title.lower()
+            return "verify" in t or "robot" in t or "just a moment" in t or "cloudflare" in t
 
-            for i in range(40):
-                if not _on_verify_page(dp):
+        if _on_verify_page():
+            log.info("  [DrissionPage] CF verify page — waiting to pass...")
+
+            for i in range(40):  # max 80 seconds
+                if not _on_verify_page():
                     log.info(f"  [DrissionPage] ✅ CF passed in ~{i*2}s — title: {dp.title}")
                     break
 
-                # Click Continue (no-op until CF verifies, then it works)
+                # Click Continue (no-op until CF verifies, then it redirects)
                 try:
-                    btn = dp.ele("text:Continue", timeout=2)
+                    btn = dp.ele("text:Continue", timeout=1)
                     if btn:
                         btn.click()
-                        log.info(f"  [DrissionPage]   [{i*2}s] Continue clicked — "
-                                 f"title: {dp.title}")
+                        log.info(f"  [DrissionPage] [{i*2}s] Continue clicked, title: {dp.title}")
                 except Exception:
                     pass
 
                 dp.wait(2)
             else:
-                log.error("  [DrissionPage] ❌ CF verify did not pass in 80s")
+                log.error("  [DrissionPage] ❌ CF did not pass in 80s")
                 try:
                     dp.get_screenshot(path=_ss("drission_ERR_verify_timeout"))
                 except Exception:
                     pass
                 dp.quit()
-                return None
+                return None  # ← exit early, don't try to extract Gdshare
         else:
-            log.info(f"  [DrissionPage] No verify page — direct access, title: {dp.title}")
+            log.info(f"  [DrissionPage] No verify page — direct access")
 
-        # ── Extract Gdshare URL ───────────────────────────────────────────────
-        log.info(f"  [DrissionPage] On download page: {dp.title}")
+        # ── Step 4: Extract Gdshare URL (only reached after CF passed) ─────────
+        log.info(f"  [DrissionPage] On page: {dp.title}")
         log.info("  [DrissionPage] Extracting Gdshare URL...")
 
         # Method 1: data-label attribute
@@ -190,7 +184,7 @@ def _drission_get_gdshare(download1_url: str) -> str | None:
         except Exception:
             pass
 
-        # Method 2: text "Gdshare"
+        # Method 2: text search
         if not gdshare_url:
             try:
                 gd = dp.ele("text:Gdshare", timeout=5)
